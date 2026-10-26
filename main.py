@@ -1,7 +1,5 @@
 import socketio
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
 import uvicorn
 import os
 import random
@@ -10,21 +8,16 @@ sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 app = FastAPI()
 socket_app = socketio.ASGIApp(sio, app)
 
-# Раздаём статику (твои модели, карты, звуки)
-app.mount("/static", StaticFiles(directory="."), name="static")
-
-# Список доступных машин и карт (сервер должен знать о них)
 CAR_IDS = ["bmwe92", "mustang", "nissan370", "silvia"]
 MAP_IDS = ["nring", "mscrc"]
 
-# Хранилище комнат
-# rooms = { "room_id": { ... } }
 rooms = {}
-player_rooms = {} # { sid: room_id }
+player_rooms = {} # sid -> room_id
 
+# Простой корневой ответ, чтобы Render видел, что сервер жив
 @app.get("/")
-async def index():
-    return FileResponse("index.html")
+async def root():
+    return {"status": "ok", "message": "Drift Server is running"}
 
 @sio.event
 async def connect(sid, environ):
@@ -56,7 +49,7 @@ async def create_room(sid, data):
     rooms[room_id] = {
         "id": room_id,
         "host": sid,
-        "state": "lobby", # lobby, racing, results
+        "state": "lobby",
         "settings": {
             "max_players": 4,
             "is_private": False,
@@ -70,7 +63,7 @@ async def create_room(sid, data):
             }
         },
         "chat": [],
-        "queue": [], # Порядок заездов
+        "queue": [],
         "current_turn": 0
     }
     player_rooms[sid] = room_id
@@ -105,9 +98,7 @@ async def update_settings(sid, data):
     room_id = player_rooms.get(sid)
     if not room_id or room_id not in rooms: return
     room = rooms[room_id]
-    
     if room["host"] != sid: return
-    
     room["settings"].update(data)
     await sio.emit('room_update', room, room=room_id)
 
@@ -133,23 +124,17 @@ async def start_race(sid):
     room_id = player_rooms.get(sid)
     if not room_id or room_id not in rooms: return
     room = rooms[room_id]
-    
     if room["host"] != sid: return
-    
     if len(room["players"]) < 2:
         return await sio.emit('error_msg', 'Нужно минимум 2 игрока', to=sid)
     
-    # Перемешиваем порядок заездов
     player_sids = list(room["players"].keys())
     random.shuffle(player_sids)
-    
     room["queue"] = player_sids
     room["current_turn"] = 0
     room["state"] = "racing"
-    
     for p_sid in player_sids:
         room["players"][p_sid]["score"] = 0
-    
     await sio.emit('race_started', room, room=room_id)
 
 @sio.event
@@ -157,28 +142,26 @@ async def finish_run(sid, score):
     room_id = player_rooms.get(sid)
     if not room_id or room_id not in rooms: return
     room = rooms[room_id]
-    
     if room["state"] != "racing": return
     
     room["players"][sid]["score"] = score
     room["current_turn"] += 1
     
     if room["current_turn"] >= len(room["queue"]):
-        # Все проехали - результаты
         room["state"] = "results"
         await sio.emit('race_results', room, room=room_id)
     else:
-        # Следующий игрок
         await sio.emit('next_turn', room, room=room_id)
 
+# --- НОВОЕ: передача позиции во время заезда ---
 @sio.event
-async def vote_rematch(sid):
+async def move(sid, data):
     room_id = player_rooms.get(sid)
     if not room_id or room_id not in rooms: return
-    room = rooms[room_id]
-    
-    if room["state"] != "results": return
-    
-    # Просто перезапускаем
-    if room["host"] == sid:
-        await start_race(sid)
+    # data = { x, z, a, carId }
+    data['sid'] = sid
+    await sio.emit('player_moved', data, room=room_id, skip_sid=sid)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run(socket_app, host="0.0.0.0", port=port)
